@@ -6,14 +6,30 @@ import sqlite3
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
-from .database import get_db, init_db
+from .booking_repo import (
+    cancel_reservation,
+    current_flights,
+    get_reservation_status,
+    insert_reservation,
+    load_book,
+    save_book,
+)
+from .booking_service import (
+    BookingBaselineError,
+    build_book_payload,
+    reservation_window_utc,
+    solve_reservation,
+)
+from .database import begin_immediate, get_db, init_db
 from .repository import load_batch, load_conflict_group_inputs, save_batch
 from .schemas import (
     BaselineMetricsOut,
     BatchResponse,
     BestAdjacentSwapResponse,
+    BookingCreateRequest,
+    BookingFlightOut,
     ClosureWindowOut,
     ConflictGroupFlightOut,
     ConflictGroupOut,
@@ -31,6 +47,10 @@ from .schemas import (
     RequiredClosureOut,
     RequiredMutexGroupOut,
     RequiredWakeOut,
+    ReservationBookOut,
+    ReservationCreateRequest,
+    ReservationCreatedOut,
+    ReservationOut,
     RunwayConflictGroupsOut,
     RunwayReportOut,
     RunwaySwapOut,
@@ -46,7 +66,12 @@ from .schemas import (
     WakeRequest,
     default_matrix_nested,
 )
-from .separation import ClosureWindow, build_conflict_groups, delay_stats
+from .separation import (
+    ClosureWindow,
+    build_conflict_groups,
+    delay_stats,
+    sort_flights,
+)
 from .service import (
     SlotBaselineError,
     nested_matrix,
@@ -90,8 +115,15 @@ app = FastAPI(
         "冲突：尾流违规连接前后机、容量超限把触发窗口内的同跑道航班连成"
         "一组、关闭窗口冲突记为单点冲突，按跑道求含冲突的连通分量并分组"
         "返回（只读；批次不存在返回 404，非 validate 批次返回 422）。"
+        "reservation-books 跑道时隙预约簿：创建时冻结一份可行的单跑道"
+        "计划（固定航班/关闭窗口/容量）与尾流矩阵（不可行返回 422）；"
+        "预约在固定计划与已提交的有效预约中复用插入算法求最早可行 UTC "
+        "时隙（无空档或航班号重复返回 409），读取-求解-写入在同一 "
+        "BEGIN IMMEDIATE 事务内完成，跨进程并发按已提交预约重新计算；"
+        "支持查询预约簿与取消预约（立即释放时隙，固定计划不可取消，"
+        "重复取消 204，未知簿/预约 404）。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -115,6 +147,10 @@ def root() -> dict:
             "best_adjacent_swap": "POST /api/v1/trial/best-adjacent-swap",
             "joint_trial": "POST /api/v1/trial/joint",
             "slot_insert": "POST /api/v1/slots/insert",
+            "booking_create": "POST /api/v1/reservation-books",
+            "reservation_create": "POST /api/v1/reservation-books/{book_id}/reservations",
+            "booking_get": "GET /api/v1/reservation-books/{book_id}",
+            "reservation_cancel": "DELETE /api/v1/reservation-books/{book_id}/reservations/{reservation_id}",
             "batch": "GET /api/v1/batches/{batch_id}",
             "conflict_groups": "GET /api/v1/batches/{batch_id}/conflict-groups",
         },
@@ -847,6 +883,200 @@ def insert_slot_endpoint(req: SlotInsertRequest) -> SlotInsertResponse:
         inserted_order=list(result.order) if result.feasible else None,
         matrix=nested_matrix(matrix),
     )
+
+
+# ---------- reservation books ----------
+
+
+def _book_out(book: dict) -> ReservationBookOut:
+    """Serialise a loaded book: fixed flights, active reservations in final order."""
+    ordered = current_flights(book)
+    position_of = {flight.flight_no: idx for idx, flight in enumerate(ordered, start=1)}
+    reservations = [
+        ReservationOut(
+            position=position_of[r["flight_no"]],
+            reservation_id=r["reservation_id"],
+            flight_no=r["flight_no"],
+            wake=r["wake"],
+            earliest_off=r["earliest_off"],
+            latest_off=r["latest_off"],
+            assigned_off=r["assigned_off"],
+            created_at=r["created_at"],
+        )
+        for r in sorted(
+            book["reservations"],
+            key=lambda r: position_of[r["flight_no"]],
+        )
+    ]
+    fixed_sorted = sort_flights(book["fixed"])
+    return ReservationBookOut(
+        book_id=book["book_id"],
+        runway=book["runway"],
+        created_at=book["created_at"],
+        matrix=book["matrix"],
+        capacity=_capacity_out(book["capacity"]) if book["capacity"] is not None else None,
+        closures=[_window_out(w) for w in book["windows"]],
+        fixed_flights=[
+            BookingFlightOut(
+                position=idx,
+                flight_no=flight.flight_no,
+                scheduled_off=flight.scheduled_off,
+                wake=flight.wake,
+            )
+            for idx, flight in enumerate(fixed_sorted, start=1)
+        ],
+        reservations=reservations,
+        order=[flight.flight_no for flight in ordered],
+        total_fixed=len(book["fixed"]),
+        total_reservations=len(book["reservations"]),
+    )
+
+
+@app.post(
+    "/api/v1/reservation-books",
+    response_model=ReservationBookOut,
+    status_code=201,
+    tags=["booking"],
+)
+def create_reservation_book(
+    req: BookingCreateRequest, db: sqlite3.Connection = Depends(get_db)
+) -> ReservationBookOut:
+    """创建跑道时隙预约簿：接收与 slots/insert 同形的单跑道计划（现有
+    航班、关闭窗口、滚动容量）与尾流矩阵。
+
+    现有计划本身违反尾流间隔、关闭窗口或滚动容量约束时返回 422，不创建
+    预约簿；可行则将计划与约束冻结存入 SQLite，返回空预约列表的预约簿。
+    """
+    try:
+        runway, flights, windows, capacity, matrix = build_book_payload(req)
+    except BookingBaselineError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    book_id, created_at = save_book(
+        db,
+        runway=runway,
+        flights=flights,
+        windows=windows,
+        capacity=capacity,
+        matrix=matrix,
+    )
+    book = load_book(db, book_id)
+    assert book is not None
+    return _book_out(book)
+
+
+@app.post(
+    "/api/v1/reservation-books/{book_id}/reservations",
+    response_model=ReservationCreatedOut,
+    status_code=201,
+    tags=["booking"],
+)
+def create_reservation(
+    book_id: str,
+    req: ReservationCreateRequest,
+    db: sqlite3.Connection = Depends(get_db),
+) -> ReservationCreatedOut:
+    """在预约簿中预约一架离场航班。
+
+    读取冻结计划与全部有效预约、插入求解、写入预约在**同一
+    ``BEGIN IMMEDIATE`` 事务**内完成：跨进程并发时后到请求等待先到事务
+    提交，并依据已提交的预约重新计算；求解失败（无空档、航班号重复）时
+    事务回滚，不留下任何记录。无空档或同簿航班号重复返回 409。
+    """
+    begin_immediate(db)
+    try:
+        book = load_book(db, book_id)
+        if book is None:
+            raise HTTPException(status_code=404, detail=f"预约簿不存在: {book_id}")
+        existing_numbers = {
+            flight.flight_no for flight in current_flights(book)
+        }
+        if req.flight_no in existing_numbers:
+            raise HTTPException(
+                status_code=409,
+                detail=f"航班号在该预约簿内已存在（固定计划或有效预约）: {req.flight_no}",
+            )
+        result = solve_reservation(book, req)
+        if not result.feasible:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "预约区间内无可行空档：固定计划与有效预约下满足全部"
+                    f"约束的最早时刻为 {result.assigned_off.isoformat().replace('+00:00', 'Z')}"
+                ),
+            )
+        earliest_utc, latest_utc = reservation_window_utc(req)
+        reservation_id = insert_reservation(
+            db,
+            book_id=book_id,
+            flight_no=req.flight_no,
+            wake=req.wake.value,
+            earliest_off=earliest_utc,
+            latest_off=latest_utc,
+            assigned_off=result.assigned_off,
+        )
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return ReservationCreatedOut(
+        reservation_id=reservation_id,
+        book_id=book_id,
+        flight_no=req.flight_no,
+        wake=req.wake,
+        earliest_off=earliest_utc,
+        latest_off=latest_utc,
+        assigned_off=result.assigned_off,
+        insert_position=result.position,
+        order=list(result.order),
+    )
+
+
+@app.get(
+    "/api/v1/reservation-books/{book_id}",
+    response_model=ReservationBookOut,
+    tags=["booking"],
+)
+def get_reservation_book(
+    book_id: str, db: sqlite3.Connection = Depends(get_db)
+) -> ReservationBookOut:
+    """查询预约簿：冻结的固定计划/约束与当前全部有效预约（按最终离场顺序）。"""
+    book = load_book(db, book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"预约簿不存在: {book_id}")
+    return _book_out(book)
+
+
+@app.delete(
+    "/api/v1/reservation-books/{book_id}/reservations/{reservation_id}",
+    status_code=204,
+    response_class=Response,
+    tags=["booking"],
+)
+def cancel_reservation_endpoint(
+    book_id: str,
+    reservation_id: str,
+    db: sqlite3.Connection = Depends(get_db),
+) -> Response:
+    """取消预约：时隙立即释放，可被后续预约重新使用。
+
+    固定计划不是预约，不能取消；重复取消同一条预约返回 204（幂等）；
+    未知预约簿或未知预约返回 404。
+    """
+    begin_immediate(db)
+    try:
+        book = load_book(db, book_id)
+        if book is None:
+            raise HTTPException(status_code=404, detail=f"预约簿不存在: {book_id}")
+        status = get_reservation_status(db, reservation_id, book_id)
+        if status is None:
+            raise HTTPException(status_code=404, detail=f"预约不存在: {reservation_id}")
+        if status == "active":
+            cancel_reservation(db, reservation_id)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return Response(status_code=204)
 
 
 @app.get(

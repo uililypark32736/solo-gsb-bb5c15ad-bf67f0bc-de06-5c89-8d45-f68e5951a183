@@ -42,6 +42,17 @@
    仅因计划顺序相邻而合并）。每组返回按 `(计划时刻, 航班号)` 排序的航班及所含
    尾流/容量/关闭冲突数量，组按最早航班排序，未涉及冲突的航班不输出。
    该接口为**只读查询**：批次不存在返回 `404`，非 validate 批次返回 `422`。
+7. **跑道时隙预约簿（reservation-books）**：创建预约簿时接收一份与 slots/insert
+   同形的**单跑道现有计划**（航班/关闭窗口/滚动容量）与**尾流矩阵**，现有计划本身
+   不可行（尾流违规/关闭冲突/容量超限）返回 `422`；可行则把计划与约束**冻结**存入
+   SQLite。之后按 **航班号 + 尾流类别 + 最早/最晚离场时刻**提交预约，服务端复用
+   slots/insert 插入算法，在**固定计划与全部已提交有效预约**中寻找最早可行的 UTC
+   时隙：成功返回预约 ID 与 UTC 时刻，无空档返回 `409`。同簿航班号（固定计划或有效
+   预约中）不得重复，重复返回 `409`。预约的「读取—求解—写入」在同一
+   `BEGIN IMMEDIATE` 事务内完成，跨进程并发时后到请求依据**已提交**的预约重新计算，
+   失败回滚、不留下记录。支持查询预约簿当前状态与取消预约：取消立即释放时隙（航班号
+   与时刻均可再次使用），**固定计划不可取消**，重复取消返回 `204`，未知预约簿或预约
+   返回 `404`。
 
 **兼容形状**：未在任何航班上传 `locked` 字段时，validate/trial/批次回查的响应与旧版本
 完全一致（不出现 `locked`、`locked_flights`、`blocked`、`total_locked` 字段）；显式传了
@@ -64,8 +75,10 @@ docker compose up -d --build
 - ReDoc：http://localhost:8000/redoc
 - 健康检查：http://localhost:8000/health
 - 默认间隔矩阵：http://localhost:8000/matrix/default
+- 预约簿接口基址：`http://localhost:8000/api/v1/reservation-books`
 
-停止：`docker compose down`（数据保留在命名卷 `wake-data` 中；加 `-v` 可一并清除）。
+停止：`docker compose down`（批次与预约簿数据均保留在命名卷 `wake-data` 中；加 `-v`
+可一并清除）。所有表（含预约簿/预约表）在容器启动时自动创建，无需手动初始化。
 
 ## 必要配置（环境变量）
 
@@ -458,6 +471,79 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
 该接口为**只读查询**，不改写任何数据；批次不存在返回 `404`，批次模式不是
 `validate`（trial / best_adjacent_swap / joint_trial）返回 `422`。
 
+### 跑道时隙预约簿
+
+预约簿把一份可行的单跑道计划与约束**冻结**在 SQLite 中，后续预约在此基础上复用
+slots/insert 的插入算法求解；slots/insert 的判定规则（相邻尾流间隔、关闭窗口
+`[start, end)`、插入后全序列滚动容量、`(离场时刻, 航班号)` 稳定位次、整秒精度）
+在此完全一致。
+
+#### `POST /api/v1/reservation-books` — 创建预约簿
+
+请求体与 slots/insert 的「跑道 + 矩阵」部分相同（不含候选航班；`sample-booking.json`
+可直接使用）：
+
+```json
+{
+  "runway": {
+    "runway": "36L",
+    "flights": [
+      {"flight_no": "CA1001", "scheduled_off": "2026-09-18T08:00:00+08:00", "wake": "J"},
+      {"flight_no": "CA1002", "scheduled_off": "2026-09-18T08:05:00+08:00", "wake": "M"}
+    ],
+    "closures": [
+      {"start": "2026-09-18T08:10:00+08:00", "end": "2026-09-18T08:20:00+08:00"}
+    ],
+    "capacity": {"window_seconds": 600, "max_departures": 3}
+  }
+}
+```
+
+- 现有航班、关闭窗口、容量与矩阵的校验规则同 slots/insert；**所有时刻必须精确到整秒**。
+- 创建时先做可行性校验：现有计划若存在尾流间隔违规、关闭窗口冲突或滚动容量超限，
+  返回 **`422`**（响应体含各类违规数量与首个明细），不创建预约簿、不写入任何数据。
+- 可行时返回 **`201`** 与预约簿详情：`book_id`、冻结的 `fixed_flights`（固定航班，
+  不可取消）、`closures`、`capacity`、`matrix`、当前 `reservations`（此时为 `[]`）
+  与 `order`（固定计划与有效预约合并后的离场序列）。
+
+#### `POST /api/v1/reservation-books/{book_id}/reservations` — 提交预约
+
+```json
+{
+  "flight_no": "CA1999",
+  "wake": "M",
+  "earliest_off": "2026-09-18T08:03:00+08:00",
+  "latest_off": "2026-09-18T08:30:00+08:00"
+}
+```
+
+- 在冻结的固定计划与该簿**全部有效预约**合并后的序列上，复用插入算法求区间
+  `[earliest_off, latest_off]`（含两端、整秒）内的最早可行 UTC 时隙。
+- 成功返回 **`201`**：`reservation_id`、`assigned_off`（UTC，`Z` 结尾）、
+  `insert_position` 与插入后的 `order`。
+- **同簿航班号不得重复**（与固定航班或任一有效预约重名）：返回 **`409`**。
+- 区间内无可行空档：返回 **`409`**，响应体给出固定计划与有效预约约束下满足全部
+  条件的最早时刻。
+- 未知预约簿返回 `404`；请求体不合法（缺时区、最早晚于最晚、亚秒精度、非法尾流
+  等级等）返回 `422`。
+- **并发语义**：读取预约簿、求解、写入预约在**同一 `BEGIN IMMEDIATE` 事务**中完成；
+  多个进程/请求并发预约同一簿时，后到请求等待先到事务提交，并依据**已提交**的预约
+  重新求解。求解失败或航班号冲突时事务回滚，数据库中**不留下任何记录**。
+
+#### `GET /api/v1/reservation-books/{book_id}` — 查询预约簿
+
+返回预约簿的当前状态：冻结的 `fixed_flights` / `closures` / `capacity` / `matrix`，
+当前全部**有效预约** `reservations`（按最终离场顺序给出每项 `position`、
+`reservation_id`、航班号/尾流、请求区间、`assigned_off`、创建时间），合并后的
+`order` 与计数 `total_fixed` / `total_reservations`。未知预约簿返回 `404`。
+
+#### `DELETE /api/v1/reservation-books/{book_id}/reservations/{reservation_id}` — 取消预约
+
+- 取消后预约状态置为 canceled，**时隙立即释放**：该航班号与时刻可被后续预约使用。
+- **固定计划不是预约，不能取消**（用固定航班号等非预约标识调用返回 `404`）。
+- **重复取消同一条预约返回 `204`**（幂等）；取消成功同样是 `204`（无响应体）。
+- 未知预约簿、未知预约或预约不属于该簿，均返回 `404`。
+
 ### 间隔矩阵（可选字段 `matrix`）
 
 请求可携带 `matrix` 覆盖默认矩阵：
@@ -491,8 +577,13 @@ capacity 的跑道回显 `capacity` 及容量结论/试排明细，未配置的�
   组名重复/组间隔非正整数等），或 best-adjacent-swap 请求含任意 `locked=true`
   航班，或 slots/insert 请求中候选号与现有航班重复、候选最早时刻晚于最晚时刻、
   时刻未精确到整秒、**现有计划本身违反尾流/关闭窗口/容量约束**，或对非
-  validate 模式的批次请求 conflict-groups，响应体含中文原因。
-- `404`：批次 ID 不存在。
+  validate 模式的批次请求 conflict-groups，**或创建预约簿时冻结计划本身违反
+  尾流/关闭窗口/容量约束、预约请求体不合法（缺时区、最早晚于最晚、亚秒精度、
+  非法尾流等级等）**，响应体含中文原因。
+- `409`：预约冲突——预约区间内无可行空档（响应体给出约束下最早可行时刻），
+  或航班号在同一预约簿内已存在（固定计划或有效预约）。
+- `404`：批次 ID 不存在，或预约簿/预约不存在（含预约不属于该预约簿）。
+- 取消预约成功或对已取消预约重复取消均返回 `204`（幂等，无响应体）。
 
 ---
 
@@ -542,6 +633,25 @@ curl -s http://localhost:8000/api/v1/batches/<batch_id>
 
 # 离场冲突分组（只读；仅 validate 批次，其他模式 422，批次不存在 404）
 curl -s http://localhost:8000/api/v1/batches/<batch_id>/conflict-groups
+
+# 创建跑道时隙预约簿（冻结可行的单跑道计划与约束；不可行返回 422）
+curl -s -X POST http://localhost:8000/api/v1/reservation-books \
+  -H 'Content-Type: application/json' \
+  -d @sample-booking.json
+
+# 提交预约（成功 201 返回预约 ID 与 UTC 时刻；无空档/航班号重复 409）
+curl -s -X POST http://localhost:8000/api/v1/reservation-books/<book_id>/reservations \
+  -H 'Content-Type: application/json' \
+  -d '{"flight_no": "CA1999", "wake": "M",
+       "earliest_off": "2026-09-18T08:03:00+08:00",
+       "latest_off": "2026-09-18T08:30:00+08:00"}'
+
+# 查询预约簿（固定计划 + 当前有效预约 + 合并离场序列）
+curl -s http://localhost:8000/api/v1/reservation-books/<book_id>
+
+# 取消预约（立即释放时隙；重复取消 204；未知簿/预约 404；固定计划不可取消）
+curl -s -o /dev/null -w "%{http_code}\n" -X DELETE \
+  http://localhost:8000/api/v1/reservation-books/<book_id>/reservations/<reservation_id>
 ```
 
 `sample.json` 已随仓库提供（36L 跑道含关闭窗口与「10 分钟内最多 3 架」滚动容量约束，
@@ -559,7 +669,7 @@ export WAKE_DB_PATH=./wake.db            # 可选，默认 /data/wake.db
 uvicorn app.main:app --reload --port 8000
 ```
 
-运行测试（含 159 个领域逻辑与 API 端到端用例，使用临时 SQLite 文件）：
+运行测试（含 182 个领域逻辑、API 端到端与预约并发用例，使用临时 SQLite 文件）：
 
 ```bash
 python3 -m pip install pytest httpx
@@ -570,18 +680,21 @@ python3 -m pytest -q
 
 ```
 app/
-  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / batches / batches/{id}/conflict-groups / 元信息）
-  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入/冲突分组合法性与兼容序列化）
+  main.py         # FastAPI 路由（validate / trial / best-adjacent-swap / trial/joint / slots/insert / reservation-books / batches / batches/{id}/conflict-groups / 元信息）
+  schemas.py      # Pydantic 请求与响应模型、输入校验（含关闭窗口/容量/锁定/互斥组/候选插入/冲突分组/预约簿与预约合法性与兼容序列化）
   service.py      # 请求 -> 领域对象 -> 模式计算（含插入查询的现有计划 422 预检）
+  booking_service.py  # 预约簿：冻结计划可行性预检（422）、在固定计划+有效预约上复用插入算法求解
+  booking_repo.py     # 预约簿/冻结航班/关闭窗口/预约（active/canceled）的持久化与加载
   joint.py        # 联合试排：全局稳定顺序、尾流/关闭/容量/互斥组间隔不动点迭代、锁定阻塞与各约束所需时刻
   separation.py   # 核心领域逻辑：稳定排序、相邻违规、关闭冲突、滚动容量校验、避窗/容量级联试排、锁定航班可行性（blocker）、相邻交换枚举择优、候选插入空档搜索、离场冲突连通分组、默认矩阵
   timeutils.py    # 时区归一化（统一 UTC，整数秒运算）
-  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列）
+  database.py     # SQLite 连接、建表与旧库迁移（含 batches.mode CHECK 重建、互斥组表与联合试排列、预约簿/预约表与 BEGIN IMMEDIATE 写事务）
   repository.py   # 批次/航班/关闭窗口/容量/冲突/违规/试排/交换/联合试排（含互斥组与各约束所需时刻）的持久化与回查、冲突分组数据加载
   config.py       # 环境变量配置
-tests/            # pytest 领域单测 + TestClient API 测试
+tests/            # pytest 领域单测 + TestClient API 测试 + 预约簿并发测试
 Dockerfile
 docker-compose.yml
 sample.json       # 含关闭窗口与滚动容量约束的示例请求
+sample-booking.json  # 创建预约簿的示例请求
 requirements.txt
 ```

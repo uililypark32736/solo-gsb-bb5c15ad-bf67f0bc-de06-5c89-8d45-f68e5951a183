@@ -183,6 +183,50 @@ CREATE TABLE IF NOT EXISTS mutex_groups (
     UNIQUE(batch_id, group_index)
 );
 
+-- 跑道时隙预约簿：创建时冻结的单跑道计划（固定航班/关闭窗口/容量）与尾流矩阵
+CREATE TABLE IF NOT EXISTS reservation_books (
+    book_id        TEXT PRIMARY KEY,
+    runway         TEXT NOT NULL,
+    created_at     TEXT NOT NULL,
+    matrix_json    TEXT NOT NULL,
+    window_seconds INTEGER,
+    max_departures INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS reservation_flights (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id       TEXT NOT NULL REFERENCES reservation_books(book_id) ON DELETE CASCADE,
+    position      INTEGER NOT NULL,
+    flight_no     TEXT NOT NULL,
+    scheduled_off TEXT NOT NULL,
+    wake          TEXT NOT NULL,
+    UNIQUE(book_id, position)
+);
+
+CREATE TABLE IF NOT EXISTS reservation_closures (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id      TEXT NOT NULL REFERENCES reservation_books(book_id) ON DELETE CASCADE,
+    window_index INTEGER NOT NULL,
+    start_utc    TEXT NOT NULL,
+    end_utc      TEXT NOT NULL,
+    UNIQUE(book_id, window_index)
+);
+
+CREATE TABLE IF NOT EXISTS reservations (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    reservation_id TEXT NOT NULL UNIQUE,
+    book_id        TEXT NOT NULL REFERENCES reservation_books(book_id) ON DELETE CASCADE,
+    flight_no      TEXT NOT NULL,
+    wake           TEXT NOT NULL,
+    earliest_off   TEXT NOT NULL,
+    latest_off     TEXT NOT NULL,
+    assigned_off   TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active'
+        CHECK (status IN ('active', 'canceled')),
+    created_at     TEXT NOT NULL,
+    canceled_at    TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
@@ -193,6 +237,12 @@ CREATE INDEX IF NOT EXISTS idx_capacity_violations_batch ON capacity_violations(
 CREATE INDEX IF NOT EXISTS idx_trial_blockers_batch ON trial_blockers(batch_id);
 CREATE INDEX IF NOT EXISTS idx_swap_results_batch ON swap_results(batch_id);
 CREATE INDEX IF NOT EXISTS idx_mutex_groups_batch ON mutex_groups(batch_id);
+CREATE INDEX IF NOT EXISTS idx_reservation_flights_book ON reservation_flights(book_id);
+CREATE INDEX IF NOT EXISTS idx_reservation_closures_book ON reservation_closures(book_id);
+CREATE INDEX IF NOT EXISTS idx_reservations_book ON reservations(book_id);
+-- 同一预约簿内仅活跃预约的航班号唯一（取消后立即释放，可再次预约）
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_active_flight_no
+    ON reservations(book_id, flight_no) WHERE status = 'active';
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -309,7 +359,11 @@ def _connect(db_path: str) -> sqlite3.Connection:
     directory = os.path.dirname(db_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
+    # check_same_thread=False: requests may be served from different worker
+    # threads (e.g. test portals or shared executors); each request still gets
+    # its own connection, and SQLite file locking plus BEGIN IMMEDIATE
+    # transactions provide the actual cross-process/thread serialization.
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -341,3 +395,18 @@ def get_db() -> Iterator[sqlite3.Connection]:
     """FastAPI dependency."""
     with get_conn() as conn:
         yield conn
+
+
+def begin_immediate(conn: sqlite3.Connection) -> None:
+    """Acquire a database-level RESERVED lock for the current transaction.
+
+    Reservation requests must perform read-solve-write atomically *across
+    processes*: a plain ``BEGIN`` (deferred) takes no lock until the first
+    write, so two concurrent requests could both read the same committed
+    reservations and the second writer would silently overwrite the first
+    one's slot. ``BEGIN IMMEDIATE`` takes the write lock up front; late
+    requests block (up to the connection's busy timeout, 30 s) until the
+    earlier transaction commits and then re-read everything inside the same
+    transaction, recomputing against the newly committed reservations.
+    """
+    conn.execute("BEGIN IMMEDIATE")

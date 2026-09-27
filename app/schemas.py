@@ -355,6 +355,102 @@ class SlotInsertRequest(BaseModel):
         return moments
 
 
+# ---------- reservation books ----------
+
+
+class BookingCreateRequest(BaseModel):
+    """创建跑道时隙预约簿：冻结一份与 slots/insert 同形的单跑道计划
+    （现有航班、关闭窗口、滚动容量）与尾流矩阵。
+
+    所有时刻必须精确到整秒；现有计划本身必须可行（无尾流违规、无关闭
+    窗口冲突、无滚动容量超限），否则返回 422，不创建预约簿。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runway: RunwayIn = Field(..., description="冻结的单条跑道航班计划、关闭窗口与滚动容量")
+    matrix: list[MatrixEntryIn] | None = Field(
+        default=None,
+        description="前机—后机最小间隔矩阵；缺省使用内置 ICAO 风格默认矩阵。"
+        "提供时仅列出的组合生效，未列出的组合视为无最小间隔(0 秒)。",
+    )
+
+    @model_validator(mode="after")
+    def _validate_booking(self) -> BookingCreateRequest:
+        for label, moment in self._all_moments():
+            if moment.microsecond != 0:
+                raise ValueError(f"时刻必须精确到整秒（不允许毫秒/微秒）: {label}")
+        if self.matrix is not None:
+            pairs: set[tuple[str, str]] = set()
+            for entry in self.matrix:
+                pair = (entry.leader.value, entry.follower.value)
+                if pair in pairs:
+                    raise ValueError(
+                        f"间隔矩阵组合重复: leader={pair[0]} follower={pair[1]}"
+                    )
+                pairs.add(pair)
+        return self
+
+    def _all_moments(self) -> list[tuple[str, datetime]]:
+        moments: list[tuple[str, datetime]] = [
+            (f"航班 {f.flight_no} 的 scheduled_off", f.scheduled_off)
+            for f in self.runway.flights
+        ]
+        moments += [
+            (f"关闭窗口 {label}", moment)
+            for w in self.runway.closures
+            for label, moment in (("start", w.start), ("end", w.end))
+        ]
+        return moments
+
+
+class ReservationCreateRequest(BaseModel):
+    """在已冻结的预约簿中预约一架离场航班。
+
+    可离场区间为 ``[earliest_off, latest_off]`` 闭区间（含两端），时刻必须
+    带时区且精确到整秒。服务端在固定计划与已提交的有效预约中，复用
+    slots/insert 的插入算法求最早可行时隙。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    flight_no: str = Field(..., min_length=1, examples=["CA1999"])
+    wake: Wake = Field(..., description="尾流等级: L 轻型 / M 中型 / H 重型 / J 超重型")
+    earliest_off: datetime = Field(
+        ..., description="最早离场时刻（含），ISO 8601，必须带时区且精确到整秒"
+    )
+    latest_off: datetime = Field(
+        ..., description="最晚离场时刻（含），ISO 8601，必须带时区且精确到整秒"
+    )
+
+    @field_validator("flight_no")
+    @classmethod
+    def _strip_flight_no(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("flight_no 不能为空")
+        return v
+
+    @field_validator("earliest_off", "latest_off")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("最早/最晚离场时刻必须携带时区信息（ISO 8601 offset 或 Z）")
+        return v
+
+    @model_validator(mode="after")
+    def _validate_reservation(self) -> ReservationCreateRequest:
+        if self.earliest_off > self.latest_off:
+            raise ValueError("最早离场时刻不能晚于最晚离场时刻（区间含两端）")
+        for label, moment in (
+            ("earliest_off", self.earliest_off),
+            ("latest_off", self.latest_off),
+        ):
+            if moment.microsecond != 0:
+                raise ValueError(f"时刻必须精确到整秒（不允许毫秒/微秒）: {label}")
+        return self
+
+
 # ---------- response models ----------
 
 
@@ -1169,3 +1265,60 @@ def matrix_to_nested(flat: dict[tuple[str, str], int]) -> dict[str, dict[str, in
 
 def default_matrix_nested() -> dict[str, dict[str, int]]:
     return {k: dict(v) for k, v in DEFAULT_MATRIX.items()}
+
+
+# ---------- reservation book outputs ----------
+
+
+class BookingFlightOut(BaseModel):
+    """创建预约簿时冻结的固定航班（不可取消）。"""
+
+    position: int
+    flight_no: str
+    scheduled_off: datetime
+    wake: Wake
+
+
+class ReservationOut(BaseModel):
+    """一条有效预约（查询预约簿时按最终离场顺序给出，位次为 1 基）。"""
+
+    position: int = Field(..., description="在固定计划+有效预约全序列中的位次（1 基）")
+    reservation_id: str
+    flight_no: str
+    wake: Wake
+    earliest_off: datetime
+    latest_off: datetime
+    assigned_off: datetime
+    created_at: datetime
+
+
+class ReservationBookOut(BaseModel):
+    """预约簿及其当前有效预约（固定计划与约束冻结不变）。"""
+
+    book_id: str
+    runway: str
+    created_at: datetime
+    matrix: dict[str, dict[str, int]]
+    capacity: CapacityOut | None
+    closures: list[ClosureWindowOut]
+    fixed_flights: list[BookingFlightOut]
+    reservations: list[ReservationOut]
+    order: list[str] = Field(
+        ..., description="固定计划与有效预约合并后的当前离场序列（航班号）"
+    )
+    total_fixed: int
+    total_reservations: int
+
+
+class ReservationCreatedOut(BaseModel):
+    """预约成功：预约 ID、最终分配的 UTC 时隙与插入位次。"""
+
+    reservation_id: str
+    book_id: str
+    flight_no: str
+    wake: Wake
+    earliest_off: datetime
+    latest_off: datetime
+    assigned_off: datetime
+    insert_position: int
+    order: list[str]
