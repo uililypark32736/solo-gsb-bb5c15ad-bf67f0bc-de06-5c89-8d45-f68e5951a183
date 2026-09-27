@@ -1,0 +1,15 @@
+services:
+  wake-api:
+    build: .
+    image: runway-wake-separation:latest
+    container_name: runway-wake-api
+    ports:
+      - "8000:8000"
+    environment:
+      WAKE_DB_PATH: /data/wake.db
+    volumes:
+      - wake-data:/data
+    restart: unless-stopped
+
+volumes:
+  wake-data:
