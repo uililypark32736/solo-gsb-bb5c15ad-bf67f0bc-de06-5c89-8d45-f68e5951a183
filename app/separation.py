@@ -766,6 +766,30 @@ def best_adjacent_swap(
 
 
 @dataclass(frozen=True, slots=True)
+class Reservation:
+    """A booked runway slot inside a slot book.
+
+    ``assigned_off`` is the committed UTC departure instant found by the
+    insertion search at booking time and ``position`` the 1-based slot the
+    candidate took in the schedule of that moment (frozen plan plus the
+    then-active reservations). ``status`` is ``active`` until the
+    reservation is cancelled; cancellation immediately frees the slot for
+    later bookings while the record stays for audit.
+    """
+
+    reservation_id: str
+    flight_no: str
+    wake: str
+    earliest_off: datetime
+    latest_off: datetime
+    assigned_off: datetime
+    position: int
+    status: str  # "active" | "cancelled"
+    created_at: datetime
+    cancelled_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class SlotInsertResult:
     """Outcome of an insertion-slot search for one candidate flight.
 

@@ -355,8 +355,69 @@ class SlotInsertRequest(BaseModel):
         return moments
 
 
-# ---------- response models ----------
+class SlotBookCreateRequest(BaseModel):
+    """创建跑道时隙预约簿：单跑道计划 + 可选间隔矩阵（同 slots/insert 的
+    请求结构去掉候选航班）。
 
+    计划先按 slots/insert 的同一套规则校验可行性（尾流间隔、关闭窗口、
+    滚动容量），可行则将计划与约束**冻结**入库；不可行返回 422。
+    所有时刻必须精确到整秒。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    runway: RunwayIn = Field(..., description="待冻结的单跑道航班计划、关闭窗口与滚动容量")
+    matrix: list[MatrixEntryIn] | None = Field(
+        default=None,
+        description="前机—后机最小间隔矩阵；缺省使用内置 ICAO 风格默认矩阵。"
+        "提供时仅列出的组合生效，未列出的组合视为无最小间隔(0 秒)。",
+    )
+
+    @model_validator(mode="after")
+    def _validate_book(self) -> SlotBookCreateRequest:
+        moments: list[tuple[str, datetime]] = [
+            (f"航班 {f.flight_no} 的 scheduled_off", f.scheduled_off)
+            for f in self.runway.flights
+        ]
+        moments += [
+            (f"关闭窗口 {label}", moment)
+            for w in self.runway.closures
+            for label, moment in (("start", w.start), ("end", w.end))
+        ]
+        for label, moment in moments:
+            if moment.microsecond != 0:
+                raise ValueError(f"时刻必须精确到整秒（不允许毫秒/微秒）: {label}")
+        if self.matrix is not None:
+            pairs: set[tuple[str, str]] = set()
+            for entry in self.matrix:
+                pair = (entry.leader.value, entry.follower.value)
+                if pair in pairs:
+                    raise ValueError(
+                        f"间隔矩阵组合重复: leader={pair[0]} follower={pair[1]}"
+                    )
+                pairs.add(pair)
+        return self
+
+
+class ReservationIn(CandidateIn):
+    """预约请求：航班号、尾流类别与最早/最晚离场时刻（闭区间、整秒）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def _validate_window(self) -> ReservationIn:
+        if self.earliest_off > self.latest_off:
+            raise ValueError("最早离场时刻不能晚于最晚离场时刻（区间含两端）")
+        for label, moment in (
+            ("earliest_off", self.earliest_off),
+            ("latest_off", self.latest_off),
+        ):
+            if moment.microsecond != 0:
+                raise ValueError(f"时刻必须精确到整秒（不允许毫秒/微秒）: {label}")
+        return self
+
+
+# ---------- response models ----------
 
 class ClosureWindowOut(BaseModel):
     start: datetime
@@ -780,11 +841,53 @@ class SlotInsertResponse(BaseModel):
     matrix: dict[str, dict[str, int]]
 
 
+class SlotBookFlightOut(BaseModel):
+    """One flight of the book's frozen plan."""
+
+    position: int = Field(..., description="冻结计划中的稳定排序位次（1 基）")
+    flight_no: str
+    wake: Wake
+    scheduled_off: datetime
+
+
+class ReservationOut(BaseModel):
+    """一条预约记录（含已取消记录，``status`` 区分）。"""
+
+    reservation_id: str
+    book_id: str
+    flight_no: str
+    wake: Wake
+    earliest_off: datetime = Field(..., description="预约最早离场时刻（UTC 回显）")
+    latest_off: datetime = Field(..., description="预约最晚离场时刻（UTC 回显）")
+    assigned_off: datetime = Field(..., description="预约成功的 UTC 离场时刻")
+    position: int = Field(
+        ..., description="预约成功时在当日合成序列中的插入位次（1 基）"
+    )
+    status: Literal["active", "cancelled"]
+    created_at: datetime
+    cancelled_at: datetime | None = None
+
+
+class SlotBookOut(BaseModel):
+    """预约簿：冻结的单跑道计划与约束 + 全部预约记录。"""
+
+    book_id: str
+    runway: str
+    created_at: datetime
+    matrix: dict[str, dict[str, int]]
+    closures: list[ClosureWindowOut]
+    capacity: CapacityOut | None
+    flights: list[SlotBookFlightOut] = Field(..., description="冻结计划（不可取消）")
+    reservations: list[ReservationOut] = Field(
+        ..., description="全部预约记录（含已取消），按创建时间排序"
+    )
+    active_reservations: int = Field(..., description="当前有效预约数量")
+
+
 class MutexGroupOut(BaseModel):
     name: str
     runways: list[str]
     min_interval_seconds: int
-
 
 class RequiredWakeOut(BaseModel):
     required_off: datetime

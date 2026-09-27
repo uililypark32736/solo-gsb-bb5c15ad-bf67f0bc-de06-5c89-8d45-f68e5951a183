@@ -183,6 +183,59 @@ CREATE TABLE IF NOT EXISTS mutex_groups (
     UNIQUE(batch_id, group_index)
 );
 
+-- Runway slot booking books: the single-runway plan and its constraints are
+-- frozen at creation time; reservations are booked against the frozen plan
+-- plus the still-active reservations.
+CREATE TABLE IF NOT EXISTS slot_books (
+    book_id     TEXT PRIMARY KEY,
+    runway      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    matrix_json TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS slot_book_flights (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id       TEXT NOT NULL REFERENCES slot_books(book_id) ON DELETE CASCADE,
+    position      INTEGER NOT NULL,
+    flight_no     TEXT NOT NULL,
+    scheduled_off TEXT NOT NULL,
+    wake          TEXT NOT NULL,
+    UNIQUE(book_id, position),
+    UNIQUE(book_id, flight_no)
+);
+
+CREATE TABLE IF NOT EXISTS slot_book_closures (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id      TEXT NOT NULL REFERENCES slot_books(book_id) ON DELETE CASCADE,
+    window_index INTEGER NOT NULL,
+    start_utc    TEXT NOT NULL,
+    end_utc      TEXT NOT NULL,
+    UNIQUE(book_id, window_index)
+);
+
+CREATE TABLE IF NOT EXISTS slot_book_capacity (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    book_id        TEXT NOT NULL REFERENCES slot_books(book_id) ON DELETE CASCADE,
+    window_seconds INTEGER NOT NULL,
+    max_departures INTEGER NOT NULL,
+    UNIQUE(book_id)
+);
+
+CREATE TABLE IF NOT EXISTS reservations (
+    reservation_id TEXT PRIMARY KEY,
+    book_id        TEXT NOT NULL REFERENCES slot_books(book_id) ON DELETE CASCADE,
+    flight_no      TEXT NOT NULL,
+    wake           TEXT NOT NULL,
+    earliest_off   TEXT NOT NULL,
+    latest_off     TEXT NOT NULL,
+    assigned_off   TEXT NOT NULL,
+    position       INTEGER NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'active'
+                   CHECK (status IN ('active', 'cancelled')),
+    created_at     TEXT NOT NULL,
+    cancelled_at   TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_flights_batch ON flights(batch_id);
 CREATE INDEX IF NOT EXISTS idx_violations_batch ON violations(batch_id);
 CREATE INDEX IF NOT EXISTS idx_trial_batch ON trial_items(batch_id);
@@ -193,6 +246,14 @@ CREATE INDEX IF NOT EXISTS idx_capacity_violations_batch ON capacity_violations(
 CREATE INDEX IF NOT EXISTS idx_trial_blockers_batch ON trial_blockers(batch_id);
 CREATE INDEX IF NOT EXISTS idx_swap_results_batch ON swap_results(batch_id);
 CREATE INDEX IF NOT EXISTS idx_mutex_groups_batch ON mutex_groups(batch_id);
+CREATE INDEX IF NOT EXISTS idx_slot_book_flights_book ON slot_book_flights(book_id);
+CREATE INDEX IF NOT EXISTS idx_slot_book_closures_book ON slot_book_closures(book_id);
+CREATE INDEX IF NOT EXISTS idx_reservations_book ON reservations(book_id);
+-- A flight number may be booked at most once per book while the reservation
+-- is active (cancellation frees it for reuse); enforced again inside the
+-- booking transaction, this index is the last line of defence.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reservations_active_flight
+    ON reservations(book_id, flight_no) WHERE status = 'active';
 """
 
 # Columns added after the initial release: existing database files (e.g. the
@@ -309,7 +370,11 @@ def _connect(db_path: str) -> sqlite3.Connection:
     directory = os.path.dirname(db_path)
     if directory:
         os.makedirs(directory, exist_ok=True)
-    conn = sqlite3.connect(db_path, timeout=30)
+    # check_same_thread=False: FastAPI may enter the dependency and run the
+    # endpoint on different threadpool workers; each connection still stays
+    # confined to a single request lifecycle (never used concurrently), and
+    # SQLite itself is compiled in serialized (thread-safe) mode.
+    conn = sqlite3.connect(db_path, timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
@@ -340,4 +405,32 @@ def get_conn(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
 def get_db() -> Iterator[sqlite3.Connection]:
     """FastAPI dependency."""
     with get_conn() as conn:
+        yield conn
+
+
+@contextmanager
+def immediate_conn(db_path: str | None = None) -> Iterator[sqlite3.Connection]:
+    """Connection inside a ``BEGIN IMMEDIATE`` write transaction.
+
+    Used by the booking endpoint so that reading the book state, solving the
+    insertion and writing the reservation form one atomic unit across
+    processes: a concurrent booking waits (up to the connect timeout) for the
+    in-flight transaction to commit, then recomputes on the freshly committed
+    reservations. Any failure rolls back without leaving records behind.
+    """
+    conn = _connect(db_path or settings.db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def get_booking_db() -> Iterator[sqlite3.Connection]:
+    """FastAPI dependency: booking transaction (``BEGIN IMMEDIATE``)."""
+    with immediate_conn() as conn:
         yield conn

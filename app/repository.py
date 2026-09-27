@@ -14,6 +14,7 @@ from .separation import (
     ClosureConflict,
     ClosureWindow,
     Flight,
+    Reservation,
     SwapRunwayResult,
     TrialRunwayResult,
     Violation,
@@ -433,6 +434,209 @@ def _required_times_json(blocked: JointBlocker) -> str:
         "capacity",
         "mutex_group",
     )})
+
+
+def save_slot_book(
+    conn: sqlite3.Connection,
+    *,
+    runway: str,
+    flights: list[Flight],
+    windows: list[ClosureWindow],
+    capacity: Capacity | None,
+    matrix: dict[tuple[str, str], int],
+) -> str:
+    """Freeze a feasible single-runway plan and its constraints as a book."""
+    book_id = new_batch_id()
+    created_at = datetime.now(timezone.utc).isoformat()
+    matrix_json = json.dumps(
+        {f"{leader}->{follower}": seconds for (leader, follower), seconds in matrix.items()},
+        sort_keys=True,
+    )
+    conn.execute(
+        "INSERT INTO slot_books (book_id, runway, created_at, matrix_json)"
+        " VALUES (?, ?, ?, ?)",
+        (book_id, runway, created_at, matrix_json),
+    )
+    for position, flight in enumerate(flights, start=1):
+        conn.execute(
+            "INSERT INTO slot_book_flights (book_id, position, flight_no,"
+            " scheduled_off, wake) VALUES (?, ?, ?, ?, ?)",
+            (book_id, position, flight.flight_no, _iso(flight.scheduled_off), flight.wake),
+        )
+    for index, window in enumerate(windows, start=1):
+        conn.execute(
+            "INSERT INTO slot_book_closures (book_id, window_index, start_utc, end_utc)"
+            " VALUES (?, ?, ?, ?)",
+            (book_id, index, _iso(window.start), _iso(window.end)),
+        )
+    if capacity is not None:
+        conn.execute(
+            "INSERT INTO slot_book_capacity (book_id, window_seconds, max_departures)"
+            " VALUES (?, ?, ?)",
+            (book_id, capacity.window_seconds, capacity.max_departures),
+        )
+    return book_id
+
+
+def _reservation_from_row(row: sqlite3.Row) -> Reservation:
+    return Reservation(
+        reservation_id=row["reservation_id"],
+        flight_no=row["flight_no"],
+        wake=row["wake"],
+        earliest_off=_dt(row["earliest_off"]),
+        latest_off=_dt(row["latest_off"]),
+        assigned_off=_dt(row["assigned_off"]),
+        position=row["position"],
+        status=row["status"],
+        created_at=_dt(row["created_at"]),
+        cancelled_at=_dt(row["cancelled_at"]) if row["cancelled_at"] else None,
+    )
+
+
+def load_slot_book(conn: sqlite3.Connection, book_id: str) -> dict | None:
+    """Reconstruct a slot book: frozen plan, constraints and reservations.
+
+    Returns ``None`` when the book does not exist. ``flights`` comes back in
+    the frozen stable order, ``reservations`` in creation order (both
+    ``active`` and ``cancelled`` records).
+    """
+    row = conn.execute(
+        "SELECT book_id, runway, created_at, matrix_json FROM slot_books"
+        " WHERE book_id = ?",
+        (book_id,),
+    ).fetchone()
+    if row is None:
+        return None
+
+    matrix = {
+        tuple(pair.split("->", 1)): seconds
+        for pair, seconds in json.loads(row["matrix_json"]).items()
+    }
+    flights = [
+        Flight(
+            flight_no=fr["flight_no"],
+            scheduled_off=_dt(fr["scheduled_off"]),
+            wake=fr["wake"],
+            runway=row["runway"],
+        )
+        for fr in conn.execute(
+            "SELECT flight_no, scheduled_off, wake FROM slot_book_flights"
+            " WHERE book_id = ? ORDER BY position",
+            (book_id,),
+        )
+    ]
+    windows = [
+        ClosureWindow(start=_dt(cr["start_utc"]), end=_dt(cr["end_utc"]))
+        for cr in conn.execute(
+            "SELECT start_utc, end_utc FROM slot_book_closures"
+            " WHERE book_id = ? ORDER BY window_index",
+            (book_id,),
+        )
+    ]
+    cap_row = conn.execute(
+        "SELECT window_seconds, max_departures FROM slot_book_capacity"
+        " WHERE book_id = ?",
+        (book_id,),
+    ).fetchone()
+    capacity = (
+        Capacity(
+            window_seconds=cap_row["window_seconds"],
+            max_departures=cap_row["max_departures"],
+        )
+        if cap_row is not None
+        else None
+    )
+    reservations = [
+        _reservation_from_row(rr)
+        for rr in conn.execute(
+            "SELECT * FROM reservations WHERE book_id = ?"
+            " ORDER BY created_at, reservation_id",
+            (book_id,),
+        )
+    ]
+    return {
+        "book_id": row["book_id"],
+        "runway": row["runway"],
+        "created_at": row["created_at"],
+        "matrix": matrix,
+        "flights": flights,
+        "windows": windows,
+        "capacity": capacity,
+        "reservations": reservations,
+    }
+
+
+def insert_reservation(
+    conn: sqlite3.Connection,
+    *,
+    book_id: str,
+    flight_no: str,
+    wake: str,
+    earliest_off: datetime,
+    latest_off: datetime,
+    assigned_off: datetime,
+    position: int,
+) -> Reservation:
+    """Persist a booked reservation (status ``active``) and return it."""
+    reservation_id = uuid4().hex
+    created_at = datetime.now(timezone.utc)
+    conn.execute(
+        "INSERT INTO reservations (reservation_id, book_id, flight_no, wake,"
+        " earliest_off, latest_off, assigned_off, position, status, created_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)",
+        (
+            reservation_id,
+            book_id,
+            flight_no,
+            wake,
+            _iso(earliest_off),
+            _iso(latest_off),
+            _iso(assigned_off),
+            position,
+            created_at.isoformat(),
+        ),
+    )
+    return Reservation(
+        reservation_id=reservation_id,
+        flight_no=flight_no,
+        wake=wake,
+        earliest_off=ensure_utc(earliest_off),
+        latest_off=ensure_utc(latest_off),
+        assigned_off=ensure_utc(assigned_off),
+        position=position,
+        status="active",
+        created_at=created_at,
+        cancelled_at=None,
+    )
+
+
+def load_reservation(
+    conn: sqlite3.Connection, book_id: str, reservation_id: str
+) -> Reservation | None:
+    """One reservation of a book (any status); ``None`` when unknown."""
+    row = conn.execute(
+        "SELECT * FROM reservations WHERE book_id = ? AND reservation_id = ?",
+        (book_id, reservation_id),
+    ).fetchone()
+    return _reservation_from_row(row) if row is not None else None
+
+
+def cancel_reservation(conn: sqlite3.Connection, reservation_id: str) -> None:
+    """Mark a reservation cancelled, freeing its slot immediately."""
+    conn.execute(
+        "UPDATE reservations SET status = 'cancelled', cancelled_at = ?"
+        " WHERE reservation_id = ?",
+        (datetime.now(timezone.utc).isoformat(), reservation_id),
+    )
+
+
+def slot_book_exists(conn: sqlite3.Connection, book_id: str) -> bool:
+    return (
+        conn.execute(
+            "SELECT 1 FROM slot_books WHERE book_id = ?", (book_id,)
+        ).fetchone()
+        is not None
+    )
 
 
 def load_conflict_group_inputs(
